@@ -6,7 +6,7 @@ import logging
 
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.enums import ChatAction
-from aiogram.filters import Command
+from aiogram.filters import Command, BaseFilter
 from aiogram.types import (
     BufferedInputFile,
     CallbackQuery,
@@ -49,8 +49,19 @@ TELEGRAM_MESSAGE_LIMIT = 4096
 router = Router()
 openai_client: AsyncOpenAI | None = None
 
-# Чаты, ожидающие ввод описания для генерации изображения (после нажатия «Картинка»)
+# Чаты, ожидающие ввод описания для генерации изображения
 _chats_waiting_image_prompt: set[int] = set()
+# Чаты в меню настроек изображения (после нажатия «Картинка»)
+_chats_in_image_menu: set[int] = set()
+# Настройки генерации изображения по чатам
+_image_settings: dict[int, dict[str, str]] = {}
+
+DEFAULT_IMAGE_SETTINGS = {
+    "quality": "low",
+    "size": "1024x1536",
+    "background": "auto",
+    "output_format": "png",
+}
 
 
 def get_openai_client() -> AsyncOpenAI:
@@ -73,6 +84,71 @@ def build_main_keyboard() -> ReplyKeyboardMarkup:
             [KeyboardButton(text="Обнулить статистику"), KeyboardButton(text="Картинка")],
         ],
         resize_keyboard=True,
+    )
+
+
+def build_image_settings_keyboard() -> ReplyKeyboardMarkup:
+    """Клавиатура настроек генерации изображения."""
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="Качество"), KeyboardButton(text="Размер")],
+            [KeyboardButton(text="Фон"), KeyboardButton(text="Формат")],
+            [KeyboardButton(text="Ввести описание"), KeyboardButton(text="Выйти")],
+        ],
+        resize_keyboard=True,
+    )
+
+
+def get_image_settings(chat_id: int) -> dict[str, str]:
+    """Получить настройки изображения для чата (с подстановкой значений по умолчанию)."""
+    if chat_id not in _image_settings:
+        _image_settings[chat_id] = DEFAULT_IMAGE_SETTINGS.copy()
+    return _image_settings[chat_id]
+
+
+def build_quality_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="low", callback_data="img_q:low")],
+        [InlineKeyboardButton(text="medium", callback_data="img_q:medium")],
+        [InlineKeyboardButton(text="high", callback_data="img_q:high")],
+        [InlineKeyboardButton(text="auto", callback_data="img_q:auto")],
+    ])
+
+
+def build_size_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="Square 1024×1024", callback_data="img_s:1024x1024")],
+        [InlineKeyboardButton(text="Portrait 1024×1536", callback_data="img_s:1024x1536")],
+        [InlineKeyboardButton(text="Landscape 1536×1024", callback_data="img_s:1536x1024")],
+        [InlineKeyboardButton(text="auto", callback_data="img_s:auto")],
+    ])
+
+
+def build_background_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="transparent", callback_data="img_bg:transparent")],
+        [InlineKeyboardButton(text="opaque", callback_data="img_bg:opaque")],
+        [InlineKeyboardButton(text="auto", callback_data="img_bg:auto")],
+    ])
+
+
+def build_format_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="png", callback_data="img_fmt:png")],
+        [InlineKeyboardButton(text="webp", callback_data="img_fmt:webp")],
+        [InlineKeyboardButton(text="jpeg", callback_data="img_fmt:jpeg")],
+    ])
+
+
+def format_image_settings_text(chat_id: int) -> str:
+    """Текст с текущими настройками изображения."""
+    s = get_image_settings(chat_id)
+    size_labels = {"1024x1024": "Square 1024×1024", "1024x1536": "Portrait 1024×1536", "1536x1024": "Landscape 1536×1024", "auto": "auto"}
+    return (
+        f"Качество: **{s['quality']}**\n"
+        f"Размер: **{size_labels.get(s['size'], s['size'])}**\n"
+        f"Фон: **{s['background']}**\n"
+        f"Формат: **{s['output_format']}**"
     )
 
 
@@ -217,12 +293,14 @@ async def cmd_reset_stats(message: Message) -> None:
 # handlers: генерация изображения по промпту
 # ---------------------------------------------------------------------------
 
-async def generate_image(prompt: str) -> tuple[bytes | None, str | None]:
+async def generate_image(prompt: str, settings: dict[str, str] | None = None) -> tuple[bytes | None, str | None]:
     """
     Сгенерировать изображение по текстовому описанию.
+    settings: quality, size, background, output_format (для gpt-image-*).
     Возвращает (bytes, None) при ответе в base64 или (None, url) при ответе по URL.
     При ошибке — (None, None).
     """
+    settings = settings or DEFAULT_IMAGE_SETTINGS
     try:
         client = get_openai_client()
         kwargs = {
@@ -232,6 +310,11 @@ async def generate_image(prompt: str) -> tuple[bytes | None, str | None]:
         }
         if "dall-e" in config.OPENAI_IMAGE_MODEL.lower():
             kwargs["size"] = "1024x1024"
+        else:
+            kwargs["quality"] = settings.get("quality", "low")
+            kwargs["size"] = settings.get("size", "1024x1536")
+            kwargs["background"] = settings.get("background", "auto")
+            kwargs["output_format"] = settings.get("output_format", "png")
         response = await client.images.generate(**kwargs)
         if not response.data:
             return (None, None)
@@ -247,8 +330,58 @@ async def generate_image(prompt: str) -> tuple[bytes | None, str | None]:
 
 
 @router.message(F.text == "Картинка")
-async def cmd_image_wait_prompt(message: Message) -> None:
-    """Включить режим ожидания промпта: следующее сообщение — описание изображения."""
+async def cmd_image_menu(message: Message) -> None:
+    """Показать меню настроек генерации изображения."""
+    chat_id = message.chat.id
+    _chats_in_image_menu.add(chat_id)
+    get_image_settings(chat_id)
+    text = (
+        "Настройки генерации изображения:\n\n"
+        f"{format_image_settings_text(chat_id)}\n\n"
+        "Выберите параметр или нажмите «Ввести описание» для генерации."
+    )
+    await message.answer(
+        text,
+        reply_markup=build_image_settings_keyboard(),
+        parse_mode="Markdown",
+    )
+
+
+class ImageMenuFilter(BaseFilter):
+    """Фильтр: чат в режиме настроек изображения."""
+
+    async def __call__(self, message: Message) -> bool:
+        return message.chat.id in _chats_in_image_menu
+
+
+@router.message(ImageMenuFilter(), F.text == "Качество")
+async def cmd_image_quality(message: Message) -> None:
+    """Показать выбор качества."""
+    await message.answer("Выберите качество:", reply_markup=build_quality_keyboard())
+
+
+@router.message(ImageMenuFilter(), F.text == "Размер")
+async def cmd_image_size(message: Message) -> None:
+    """Показать выбор размера."""
+    await message.answer("Выберите размер:", reply_markup=build_size_keyboard())
+
+
+@router.message(ImageMenuFilter(), F.text == "Фон")
+async def cmd_image_background(message: Message) -> None:
+    """Показать выбор фона."""
+    await message.answer("Выберите фон:", reply_markup=build_background_keyboard())
+
+
+@router.message(ImageMenuFilter(), F.text == "Формат")
+async def cmd_image_format(message: Message) -> None:
+    """Показать выбор формата."""
+    await message.answer("Выберите формат файла:", reply_markup=build_format_keyboard())
+
+
+@router.message(ImageMenuFilter(), F.text == "Ввести описание")
+async def cmd_image_enter_prompt(message: Message) -> None:
+    """Перейти к вводу описания изображения."""
+    _chats_in_image_menu.discard(message.chat.id)
     _chats_waiting_image_prompt.add(message.chat.id)
     await message.answer(
         "Введите описание изображения в следующем сообщении:",
@@ -256,17 +389,66 @@ async def cmd_image_wait_prompt(message: Message) -> None:
     )
 
 
+@router.message(ImageMenuFilter(), F.text == "Выйти")
+async def cmd_image_exit(message: Message) -> None:
+    """Выйти из меню изображений (аналог /start)."""
+    _chats_in_image_menu.discard(message.chat.id)
+    await cmd_start(message)
+
+
+@router.callback_query(F.data.startswith("img_q:"))
+async def callback_image_quality(callback: CallbackQuery) -> None:
+    """Сохранение выбора качества."""
+    value = callback.data.removeprefix("img_q:")
+    get_image_settings(callback.message.chat.id)["quality"] = value
+    await callback.answer(f"Качество: {value}")
+    text = f"Настройки обновлены.\n\n{format_image_settings_text(callback.message.chat.id)}"
+    await callback.message.answer(text, reply_markup=build_image_settings_keyboard(), parse_mode="Markdown")
+
+
+@router.callback_query(F.data.startswith("img_s:"))
+async def callback_image_size(callback: CallbackQuery) -> None:
+    """Сохранение выбора размера."""
+    value = callback.data.removeprefix("img_s:")
+    get_image_settings(callback.message.chat.id)["size"] = value
+    await callback.answer(f"Размер: {value}")
+    text = f"Настройки обновлены.\n\n{format_image_settings_text(callback.message.chat.id)}"
+    await callback.message.answer(text, reply_markup=build_image_settings_keyboard(), parse_mode="Markdown")
+
+
+@router.callback_query(F.data.startswith("img_bg:"))
+async def callback_image_background(callback: CallbackQuery) -> None:
+    """Сохранение выбора фона."""
+    value = callback.data.removeprefix("img_bg:")
+    get_image_settings(callback.message.chat.id)["background"] = value
+    await callback.answer(f"Фон: {value}")
+    text = f"Настройки обновлены.\n\n{format_image_settings_text(callback.message.chat.id)}"
+    await callback.message.answer(text, reply_markup=build_image_settings_keyboard(), parse_mode="Markdown")
+
+
+@router.callback_query(F.data.startswith("img_fmt:"))
+async def callback_image_format(callback: CallbackQuery) -> None:
+    """Сохранение выбора формата."""
+    value = callback.data.removeprefix("img_fmt:")
+    get_image_settings(callback.message.chat.id)["output_format"] = value
+    await callback.answer(f"Формат: {value}")
+    text = f"Настройки обновлены.\n\n{format_image_settings_text(callback.message.chat.id)}"
+    await callback.message.answer(text, reply_markup=build_image_settings_keyboard(), parse_mode="Markdown")
+
+
 async def _handle_image_request(message: Message, prompt: str) -> None:
     """Сгенерировать изображение по промпту и отправить в чат."""
     chat_id = message.chat.id
     bot = message.bot
     keyboard = build_main_keyboard()
+    settings = get_image_settings(chat_id)
     await bot.send_chat_action(chat_id=chat_id, action=ChatAction.UPLOAD_PHOTO)
 
-    image_bytes, image_url = await generate_image(prompt)
+    image_bytes, image_url = await generate_image(prompt, settings)
+    ext = settings.get("output_format", "png")
 
     if image_bytes:
-        photo = BufferedInputFile(image_bytes, filename="image.png")
+        photo = BufferedInputFile(image_bytes, filename=f"image.{ext}")
         await message.answer_photo(photo=photo, reply_markup=keyboard)
     elif image_url:
         await message.answer_photo(photo=image_url, reply_markup=keyboard)
